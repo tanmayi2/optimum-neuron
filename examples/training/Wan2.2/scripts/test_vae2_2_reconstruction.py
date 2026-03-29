@@ -2,7 +2,7 @@
 """
 Encode → decode smoke test for the frozen Wan 2.2 VAE (vae2_2).
 
-Run from the Wan2.2 example root (so ``import wan`` resolves):
+Run from anywhere; the script loads ``wan/modules/vae2_2.py`` directly (no full ``wan`` import):
 
     cd examples/training/Wan2.2
     python scripts/test_vae2_2_reconstruction.py \\
@@ -19,6 +19,7 @@ Pixels are expected in ``[-1, 1]``.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import logging
 import sys
 from pathlib import Path
@@ -28,12 +29,19 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-# Wan2.2 package root (parent of ``wan/``)
+# Wan2.2 tree root (parent of ``wan/``)
 _WAN_ROOT = Path(__file__).resolve().parent.parent
-if str(_WAN_ROOT) not in sys.path:
-    sys.path.insert(0, str(_WAN_ROOT))
 
-from wan.modules.vae2_2 import Wan2_2_VAE
+# Load ``vae2_2`` by file path so we never import ``wan`` (``wan/__init__.py`` pulls in
+# T5 and other modules that call ``torch.cuda`` at import time — breaks CPU/XLA hosts).
+_VAE2_2_PATH = _WAN_ROOT / "wan" / "modules" / "vae2_2.py"
+_spec = importlib.util.spec_from_file_location("wan_vae2_2_standalone", _VAE2_2_PATH)
+if _spec is None or _spec.loader is None:
+    raise ImportError(f"cannot load VAE module from {_VAE2_2_PATH}")
+_vae2_2 = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = _vae2_2
+_spec.loader.exec_module(_vae2_2)
+Wan2_2_VAE = _vae2_2.Wan2_2_VAE
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -175,14 +183,14 @@ def parse_args() -> argparse.Namespace:
         "--device",
         type=str,
         default=None,
-        help="cuda | cpu (default: cuda if available else cpu)",
+        help="cuda | cpu | xla (default: cuda if available else cpu)",
     )
     p.add_argument(
         "--dtype",
         type=str,
         default=None,
         choices=("bfloat16", "float32"),
-        help="autocast dtype for VAE (default: bfloat16 on CUDA, float32 on CPU)",
+        help="autocast dtype for VAE (default: bfloat16 on CUDA/XLA, float32 on CPU)",
     )
     return p.parse_args()
 
@@ -199,7 +207,9 @@ def main() -> None:
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     if args.dtype is None:
-        vae_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+        vae_dtype = (
+            torch.bfloat16 if device in ("cuda", "xla") else torch.float32
+        )
     else:
         vae_dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
 
@@ -240,6 +250,14 @@ def main() -> None:
         if x_hat is None:
             raise RuntimeError("VAE decode returned None")
         x_hat = x_hat[0]
+
+    if device == "xla":
+        import torch_xla.core.xla_model as xm
+
+        xm.mark_step()
+        # Materialize on CPU for scalar metrics and PIL (avoids extra lazy graphs on XLA).
+        x = x.cpu()
+        x_hat = x_hat.cpu()
 
     mse = F.mse_loss(x_hat, x).item()
     psnr = psnr_db(x_hat, x)
