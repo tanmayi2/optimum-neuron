@@ -76,9 +76,13 @@ def _trim_temporal(x: torch.Tensor) -> torch.Tensor:
 
 
 def synthetic_video(c: int, t: int, h: int, w: int, device: str, seed: int) -> torch.Tensor:
-    g = torch.Generator(device=device)
+    # torch.Generator only supports CPU/CUDA/MPS — not XLA. Sample on CPU, then move.
+    g = torch.Generator(device="cpu")
     g.manual_seed(seed)
-    return torch.randn(c, t, h, w, device=device, generator=g, dtype=torch.float32) * 0.2
+    x = torch.randn(c, t, h, w, generator=g, dtype=torch.float32) * 0.2
+    if device != "cpu":
+        x = x.to(device)
+    return x
 
 
 def load_video_tensor(
