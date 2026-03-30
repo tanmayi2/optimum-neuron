@@ -210,9 +210,21 @@ def main() -> None:
         raise FileNotFoundError(f"VAE weights not found: {vae_path}")
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Import torch_xla early — before any tensor is placed on an XLA device.
+    # torch_xla registers the "xla" backend with PyTorch; without this import
+    # calls like tensor.to("xla") or torch.tensor(..., device="xla") will fail.
+    if str(device).split(":")[0] == "xla":
+        import torch_xla
+        import torch_xla.core.xla_model as xm
+
+        # Resolve the canonical XLA device string (e.g. "xla:0").
+        device = str(xm.xla_device())
+        logger.info("XLA device: %s", device)
+
     if args.dtype is None:
         vae_dtype = (
-            torch.bfloat16 if device in ("cuda", "xla") else torch.float32
+            torch.bfloat16 if str(device).split(":")[0] in ("cuda", "xla") else torch.float32
         )
     else:
         vae_dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
@@ -255,7 +267,7 @@ def main() -> None:
             raise RuntimeError("VAE decode returned None")
         x_hat = x_hat[0]
 
-    if device == "xla":
+    if str(device).split(":")[0] == "xla":
         import torch_xla.core.xla_model as xm
 
         xm.mark_step()

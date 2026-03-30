@@ -1,11 +1,34 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import contextlib
 import logging
 
 import torch
-import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+
+
+def _autocast_ctx(device, dtype: torch.dtype):
+    """Return a device-aware autocast context manager.
+
+    Works for CUDA and CPU.  For XLA (Trainium/Inferentia) ``torch.autocast``
+    conflicts with ``torch.inference_mode()`` (version-counter error), so XLA
+    uses a no-op context instead — dtype is handled by casting model weights
+    and inputs to *dtype* at initialisation / call time (see ``Wan2_2_VAE``).
+    """
+    if dtype == torch.float32:
+        return contextlib.nullcontext()
+    # Normalise "xla:0" -> "xla", "cuda:0" -> "cuda", etc.
+    device_type = str(device).split(":")[0]
+    if device_type == "xla":
+        # torch.autocast("xla") raises "Cannot set version_counter for
+        # inference tensor" inside torch.inference_mode().  Model weights are
+        # already in the target dtype; inputs are cast explicitly in encode/decode.
+        return contextlib.nullcontext()
+    try:
+        return torch.autocast(device_type=device_type, dtype=dtype)
+    except (RuntimeError, ValueError):
+        return contextlib.nullcontext()
 
 __all__ = [
     "Wan2_2_VAE",
@@ -122,7 +145,7 @@ class Resample(nn.Module):
                     feat_cache[idx] = "Rep"
                     feat_idx[0] += 1
                 else:
-                    cache_x = x[:, :, -CACHE_T:, :, :].clone()
+                    cache_x = x[:, :, max(0, x.shape[2] - CACHE_T):, :, :].clone()
                     if (cache_x.shape[2] < 2 and feat_cache[idx] is not None and
                             feat_cache[idx] != "Rep"):
                         # cache last frame of last two chunk
@@ -220,7 +243,7 @@ class ResidualBlock(nn.Module):
         for layer in self.residual:
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
-                cache_x = x[:, :, -CACHE_T:, :, :].clone()
+                cache_x = x[:, :, max(0, x.shape[2] - CACHE_T):, :, :].clone()
                 if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                     # cache last frame of last two chunk
                     cache_x = torch.cat(
@@ -564,7 +587,7 @@ class Encoder3d(nn.Module):
 
         if feat_cache is not None:
             idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
+            cache_x = x[:, :, max(0, x.shape[2] - CACHE_T):, :, :].clone()
             if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                 cache_x = torch.cat(
                     [
@@ -598,7 +621,7 @@ class Encoder3d(nn.Module):
         for layer in self.head:
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
-                cache_x = x[:, :, -CACHE_T:, :, :].clone()
+                cache_x = x[:, :, max(0, x.shape[2] - CACHE_T):, :, :].clone()
                 if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                     cache_x = torch.cat(
                         [
@@ -676,7 +699,7 @@ class Decoder3d(nn.Module):
     def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
         if feat_cache is not None:
             idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
+            cache_x = x[:, :, max(0, x.shape[2] - CACHE_T):, :, :].clone()
             if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                 cache_x = torch.cat(
                     [
@@ -709,7 +732,7 @@ class Decoder3d(nn.Module):
         for layer in self.head:
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
-                cache_x = x[:, :, -CACHE_T:, :, :].clone()
+                cache_x = x[:, :, max(0, x.shape[2] - CACHE_T):, :, :].clone()
                 if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                     cache_x = torch.cat(
                         [
@@ -784,9 +807,12 @@ class WanVAE_(nn.Module):
         x_recon = self.decode(mu, scale)
         return x_recon, mu
 
-    def encode(self, x, scale):
+    def encode(self, x, scale, step_fn=None):
         self.clear_cache()
         x = patchify(x, patch_size=2)
+        # Chunked encoding: first chunk T=1, then T=4 per iteration.
+        # step_fn (xm.mark_step on XLA) flushes the lazy graph after each chunk
+        # to prevent all iterations fusing into one giant uncompilable graph.
         t = x.shape[2]
         iter_ = 1 + (t - 1) // 4
         for i in range(iter_):
@@ -804,24 +830,26 @@ class WanVAE_(nn.Module):
                     feat_idx=self._enc_conv_idx,
                 )
                 out = torch.cat([out, out_], 2)
+            if step_fn is not None:
+                step_fn()
         mu, log_var = self.conv1(out).chunk(2, dim=1)
-        if isinstance(scale[0], torch.Tensor):
-            mu = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(
-                1, self.z_dim, 1, 1, 1)
-        else:
-            mu = (mu - scale[0]) * scale[1]
+        # scale tensors are pre-shaped to [1, z_dim, 1, 1, 1] in Wan2_2_VAE.__init__
+        # so no .view() is needed here (avoids XLA inference-mode version-counter error).
+        mu = (mu - scale[0]) * scale[1]
+        if step_fn is not None:
+            step_fn()
         self.clear_cache()
         return mu
 
-    def decode(self, z, scale):
+    def decode(self, z, scale, step_fn=None):
         self.clear_cache()
-        if isinstance(scale[0], torch.Tensor):
-            z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
-                1, self.z_dim, 1, 1, 1)
-        else:
-            z = z / scale[1] + scale[0]
-        iter_ = z.shape[2]
+        # scale tensors are pre-shaped to [1, z_dim, 1, 1, 1] in Wan2_2_VAE.__init__
+        # so no .view() is needed here (avoids XLA inference-mode version-counter error).
+        z = z / scale[1] + scale[0]
         x = self.conv2(z)
+        if step_fn is not None:
+            step_fn()
+        iter_ = z.shape[2]
         for i in range(iter_):
             self._conv_idx = [0]
             if i == 0:
@@ -838,6 +866,8 @@ class WanVAE_(nn.Module):
                     feat_idx=self._conv_idx,
                 )
                 out = torch.cat([out, out_], 2)
+            if step_fn is not None:
+                step_fn()
         out = unpatchify(out, patch_size=2)
         self.clear_cache()
         return out
@@ -862,6 +892,36 @@ class WanVAE_(nn.Module):
         self._enc_conv_num = count_conv3d(self.encoder)
         self._enc_conv_idx = [0]
         self._enc_feat_map = [None] * self._enc_conv_num
+
+
+def _pad_12_to_16_channels(model: "WanVAE_") -> None:
+    """Pad encoder input and decoder output from 12 → 16 channels.
+
+    neuronx-cc on TRN2 has an internal bug (NCC_IBIR158 / NCC_ITEN404) that is
+    triggered by CausalConv3d weights with exactly 12 input or output channels.
+    Padding to 16 (a power-of-two aligned with Neuron's SBUF) avoids the bug
+    while preserving mathematical equivalence: the extra 4 channels are all zero
+    in both the weight and the corresponding input/output slice.
+
+    Call this once after loading the pretrained checkpoint on XLA devices.
+    """
+    # Encoder first conv: weight [160, 12, 3, 3, 3] → [160, 16, 3, 3, 3]
+    ec = model.encoder.conv1
+    ow = ec.weight  # [out_c, 12, kT, kH, kW]
+    nw = torch.zeros(ow.shape[0], 16, *ow.shape[2:], dtype=ow.dtype, device=ow.device)
+    nw[:, :12] = ow
+    ec.weight = nn.Parameter(nw, requires_grad=False)
+
+    # Decoder last conv: weight [12, dim, 3, 3, 3] → [16, dim, 3, 3, 3]
+    dc = model.decoder.head[-1]  # CausalConv3d(dec_dim_out, 12, 3)
+    ow = dc.weight  # [12, in_c, kT, kH, kW]
+    nw = torch.zeros(16, ow.shape[1], *ow.shape[2:], dtype=ow.dtype, device=ow.device)
+    nw[:12] = ow
+    dc.weight = nn.Parameter(nw, requires_grad=False)
+    ob = dc.bias  # [12]
+    nb = torch.zeros(16, dtype=ob.dtype, device=ob.device)
+    nb[:12] = ob
+    dc.bias = nn.Parameter(nb, requires_grad=False)
 
 
 def _video_vae(pretrained_path=None, z_dim=16, dim=160, device="cpu", **kwargs):
@@ -1013,9 +1073,13 @@ class Wan2_2_VAE:
             dtype=dtype,
             device=device,
         )
-        self.scale = [mean, 1.0 / std]
+        # Pre-shape to [1, z_dim, 1, 1, 1] so WanVAE_.encode/decode can broadcast
+        # directly without calling .view() inside torch.inference_mode() — that
+        # combination raises "Cannot set version_counter for inference tensor" on XLA.
+        self.scale = [mean.reshape(1, z_dim, 1, 1, 1), (1.0 / std).reshape(1, z_dim, 1, 1, 1)]
 
-        # init model
+        # init model — cast to target dtype so XLA gets native-dtype computation
+        # without needing torch.autocast (which conflicts with inference_mode).
         self.model = (
             _video_vae(
                 pretrained_path=vae_pth,
@@ -1023,18 +1087,41 @@ class Wan2_2_VAE:
                 dim=c_dim,
                 dim_mult=dim_mult,
                 temperal_downsample=temperal_downsample,
-            ).eval().requires_grad_(False).to(device))
+            ).eval().requires_grad_(False).to(dtype=dtype, device=device))
+
+        # On XLA/Trainium each encode/decode iteration must call mark_step() to
+        # flush the lazy graph, otherwise all iterations fuse into one giant graph
+        # that takes 30+ minutes to compile.
+        # Also pad 12-channel boundary convs to 16 channels to avoid the
+        # NCC_IBIR158/NCC_ITEN404 neuronx-cc compiler bug with 12-channel tensors.
+        if str(device).split(":")[0] == "xla":
+            import torch_xla.core.xla_model as xm  # already imported by caller
+            self._step_fn = xm.mark_step
+            _pad_12_to_16_channels(self.model)
+        else:
+            self._step_fn = None
 
     def encode(self, videos):
         try:
             if not isinstance(videos, list):
                 raise TypeError("videos should be a list")
-            with amp.autocast(dtype=self.dtype):
-                return [
-                    self.model.encode(u.unsqueeze(0),
-                                      self.scale).float().squeeze(0)
-                    for u in videos
-                ]
+            with _autocast_ctx(self.device, self.dtype):
+                results = []
+                for u in videos:
+                    # copy=True forces a new allocation even when dtype already matches
+                    # (avoids "version_counter for inference tensor" on XLA when the
+                    # caller passes a regular tensor into torch.inference_mode()).
+                    u_in = u.to(dtype=self.dtype, copy=True)
+                    if self._step_fn is not None:
+                        # Pad C=3 → C=4 so patchify produces 16 channels instead of 12,
+                        # avoiding the NCC_IBIR158 neuronx-cc bug with 12-channel inputs.
+                        u_in = torch.cat(
+                            [u_in, torch.zeros_like(u_in[:1])], dim=0)
+                    results.append(
+                        self.model.encode(
+                            u_in.unsqueeze(0), self.scale,
+                            step_fn=self._step_fn).float().squeeze(0))
+                return results
         except TypeError as e:
             logging.info(e)
             return None
@@ -1043,13 +1130,19 @@ class Wan2_2_VAE:
         try:
             if not isinstance(zs, list):
                 raise TypeError("zs should be a list")
-            with amp.autocast(dtype=self.dtype):
-                return [
-                    self.model.decode(u.unsqueeze(0),
-                                      self.scale).float().clamp_(-1,
-                                                                 1).squeeze(0)
-                    for u in zs
-                ]
+            with _autocast_ctx(self.device, self.dtype):
+                results = []
+                for u in zs:
+                    out = self.model.decode(
+                        u.to(dtype=self.dtype, copy=True).unsqueeze(0),
+                        self.scale,
+                        step_fn=self._step_fn).float().squeeze(0)
+                    if self._step_fn is not None:
+                        # Decoder outputs 4 channels (16-channel padded → unpatchify → 4C);
+                        # strip the zero-padded 4th channel to recover 3-channel video.
+                        out = out[:3]
+                    results.append(out.clamp(-1, 1))
+                return results
         except TypeError as e:
             logging.info(e)
             return None
