@@ -14,6 +14,18 @@ __all__ = [
 CACHE_T = 2
 
 
+def _cache_slice(x: "torch.Tensor") -> "torch.Tensor":
+    """Return the last CACHE_T frames of x along dim=2.
+
+    XLA rejects negative slice-start indices that are out of bounds for the
+    dimension size (e.g. ``x[:, :, -2:, ...]`` on a length-1 axis raises
+    "Value out of range").  Use an explicit non-negative start instead.
+    """
+    t = x.shape[2]
+    start = t - min(CACHE_T, t)   # always >= 0
+    return x[:, :, start:, :, :]
+
+
 class CausalConv3d(nn.Conv3d):
     """
     Causal 3d convolusion.
@@ -118,7 +130,7 @@ class Resample(nn.Module):
                     feat_cache[idx] = "Rep"
                     feat_idx[0] += 1
                 else:
-                    cache_x = x[:, :, -CACHE_T:, :, :].clone()
+                    cache_x = _cache_slice(x).clone()
                     if (cache_x.shape[2] < 2 and feat_cache[idx] is not None and
                             feat_cache[idx] != "Rep"):
                         # cache last frame of last two chunk
@@ -149,6 +161,12 @@ class Resample(nn.Module):
                     x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]),
                                     3)
                     x = x.reshape(b, c, t * 2, h, w)
+            else:
+                # Non-cached temporal upsample: apply time_conv to full sequence
+                x = self.time_conv(x)
+                x = x.reshape(b, 2, c, t, h, w)
+                x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
+                x = x.reshape(b, c, t * 2, h, w)
         t = x.shape[2]
         x = rearrange(x, "b c t h w -> (b t) c h w")
         x = self.resample(x)
@@ -166,6 +184,9 @@ class Resample(nn.Module):
                         torch.cat([feat_cache[idx][:, :, -1:, :, :], x], 2))
                     feat_cache[idx] = cache_x
                     feat_idx[0] += 1
+            else:
+                # Non-cached temporal downsample: apply time_conv to full sequence
+                x = self.time_conv(x)
         return x
 
     def init_weight(self, conv):
@@ -216,7 +237,7 @@ class ResidualBlock(nn.Module):
         for layer in self.residual:
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
-                cache_x = x[:, :, -CACHE_T:, :, :].clone()
+                cache_x = _cache_slice(x).clone()
                 if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                     # cache last frame of last two chunk
                     cache_x = torch.cat(
@@ -560,7 +581,7 @@ class Encoder3d(nn.Module):
 
         if feat_cache is not None:
             idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
+            cache_x = _cache_slice(x).clone()
             if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                 cache_x = torch.cat(
                     [
@@ -594,7 +615,7 @@ class Encoder3d(nn.Module):
         for layer in self.head:
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
-                cache_x = x[:, :, -CACHE_T:, :, :].clone()
+                cache_x = _cache_slice(x).clone()
                 if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                     cache_x = torch.cat(
                         [
@@ -672,7 +693,7 @@ class Decoder3d(nn.Module):
     def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
         if feat_cache is not None:
             idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
+            cache_x = _cache_slice(x).clone()
             if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                 cache_x = torch.cat(
                     [
@@ -699,13 +720,13 @@ class Decoder3d(nn.Module):
             if feat_cache is not None:
                 x = layer(x, feat_cache, feat_idx, first_chunk)
             else:
-                x = layer(x)
+                x = layer(x, first_chunk=first_chunk)
 
         ## head
         for layer in self.head:
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
-                cache_x = x[:, :, -CACHE_T:, :, :].clone()
+                cache_x = _cache_slice(x).clone()
                 if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                     cache_x = torch.cat(
                         [
@@ -780,7 +801,17 @@ class WanVAE_(nn.Module):
         x_recon = self.decode(mu, scale)
         return x_recon, mu
 
-    def encode(self, x, scale):
+    def encode(self, x, scale, step_fn=None):
+        """Encode video to latent.
+
+        Args:
+            x: input tensor (B, C, T, H, W)
+            scale: [mean, 1/std] normalisation tensors
+            step_fn: optional callable invoked after each encoder chunk and
+                after each torch.cat.  Pass ``torch_xla.core.xla_model.mark_step``
+                on XLA/Trainium to flush each chunk as a separate compiled graph,
+                avoiding the monolithic-graph instruction-limit error (NCC_EBVF030).
+        """
         self.clear_cache()
         x = patchify(x, patch_size=2)
         t = x.shape[2]
@@ -793,13 +824,19 @@ class WanVAE_(nn.Module):
                     feat_cache=self._enc_feat_map,
                     feat_idx=self._enc_conv_idx,
                 )
+                if step_fn is not None:
+                    step_fn()
             else:
                 out_ = self.encoder(
                     x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
                     feat_cache=self._enc_feat_map,
                     feat_idx=self._enc_conv_idx,
                 )
+                if step_fn is not None:
+                    step_fn()
                 out = torch.cat([out, out_], 2)
+                if step_fn is not None:
+                    step_fn()
         mu, log_var = self.conv1(out).chunk(2, dim=1)
         if isinstance(scale[0], torch.Tensor):
             mu = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(
@@ -809,7 +846,15 @@ class WanVAE_(nn.Module):
         self.clear_cache()
         return mu
 
-    def decode(self, z, scale):
+    def decode(self, z, scale, step_fn=None):
+        """Decode latent to video.
+
+        Args:
+            z: latent tensor (B, C, T, H, W)
+            scale: [mean, 1/std] normalisation tensors
+            step_fn: optional callable invoked after each decoder chunk and
+                after each torch.cat.  See ``encode`` for XLA usage.
+        """
         self.clear_cache()
         if isinstance(scale[0], torch.Tensor):
             z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
@@ -827,13 +872,19 @@ class WanVAE_(nn.Module):
                     feat_idx=self._conv_idx,
                     first_chunk=True,
                 )
+                if step_fn is not None:
+                    step_fn()
             else:
                 out_ = self.decoder(
                     x[:, :, i:i + 1, :, :],
                     feat_cache=self._feat_map,
                     feat_idx=self._conv_idx,
                 )
+                if step_fn is not None:
+                    step_fn()
                 out = torch.cat([out, out_], 2)
+                if step_fn is not None:
+                    step_fn()
         out = unpatchify(out, patch_size=2)
         self.clear_cache()
         return out
